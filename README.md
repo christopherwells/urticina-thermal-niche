@@ -80,8 +80,8 @@ Rendering `analysis.qmd` adds the derived model outputs (`04-nb-model.rds`, `04-
 
 ## Archive
 
-Archived at Zenodo: https://doi.org/10.5281/zenodo.XXXXXXX
+Archived at Zenodo: https://doi.org/10.5281/zenodo.21346545
 
 ## Cite
 
-Edgar, Penfold, Martinez, and Wells, 2026. Behavioral metabolic suppression confounds thermal performance estimates and climate vulnerability assessments in a marine ectotherm. Data and code archived at Zenodo. https://doi.org/10.5281/zenodo.XXXXXXX
+Edgar, Penfold, Martinez, and Wells, 2026. Behavioral metabolic suppression confounds thermal performance estimates and climate vulnerability assessments in a marine ectotherm. Data and code archived at Zenodo. https://doi.org/10.5281/zenodo.21346545
