@@ -1,0 +1,777 @@
+---
+title: "Encounter-rate regression, species distribution model, and thermal performance"
+subtitle: "Undescribed cold-water *Urticina* sp., Northwest Atlantic"
+format: html
+execute:
+  eval: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+# utils.R supplies load_output()/save_output() (read/write data/clean/) and themes.
+source(here::here("R", "utils.R"))
+
+library(sf)
+library(dplyr)
+library(tidyr)
+library(glmmTMB)
+library(maxnet)
+library(ENMeval)
+library(brms)
+library(loo)
+library(readxl)
+
+dir.create(here::here("figures"), showWarnings = FALSE, recursive = TRUE)
+```
+
+# Encounter-rate regression
+
+A negative binomial GLM with a log-effort offset screens all VIF-surviving predictors; those at p <= 0.1 pass to MaxEnt.
+
+```{r}
+#| label: nb-fit
+h3_uncorr <- load_output("03-predictors-uncorr")
+model_data <- h3_uncorr |>
+  st_drop_geometry() |>
+  filter(effort_n > 0) |>
+  mutate(log_effort = log(effort_n)) |>
+  drop_na()
+
+pred_names <- setdiff(names(model_data),
+                      c("h3_address", "effort_n", "urticina_n", "cpue", "log_effort"))
+
+# Scale predictors; save centers/scales for back-transformation in effect plots.
+scale_params <- data.frame(
+  variable = pred_names,
+  center   = sapply(pred_names, function(v) mean(model_data[[v]])),
+  scale    = sapply(pred_names, function(v) sd(model_data[[v]]))
+)
+for (v in pred_names) model_data[[v]] <- scale(model_data[[v]])[, 1]
+
+cond_formula <- as.formula(
+  paste("urticina_n ~", paste(pred_names, collapse = " + "), "+ offset(log_effort)")
+)
+final_model <- glmmTMB(cond_formula, family = nbinom2, data = model_data)
+nb_sum <- summary(final_model)
+
+save_output(final_model, "04-nb-model")
+save_output(nb_sum, "04-nb-summary")
+save_output(scale_params, "04-scale-params")
+
+# Predictors at p <= 0.1 pass to MaxEnt (screening threshold, not significance).
+nb_coefs <- as.data.frame(nb_sum$coefficients$cond)
+nb_coefs$term <- rownames(nb_coefs)
+nb_sig <- nb_coefs |>
+  filter(term != "(Intercept)", round(`Pr(>|z|)`, 2) <= 0.1) |>
+  pull(term)
+save_output(nb_sig, "04-nb-selected-predictors")
+```
+
+# MaxEnt species distribution model
+
+MaxEnt fit on the NB-selected predictors, with background hexes drawn with replacement in proportion to sampling effort.
+
+```{r}
+#| label: maxent-swd
+urticina_sf <- load_output("01-urticina-obs")
+h3_data     <- load_output("02-cpue-hex")
+h3_uncorr   <- load_output("03-predictors-uncorr")
+nb_selected <- load_output("04-nb-selected-predictors")
+
+# Coastal cells with complete predictor data; predictors are the NB-selected set.
+coastal_hex <- h3_uncorr |> filter(shoreline_km > 0)
+non_pred_cols <- c("h3_address", "effort_n", "urticina_n", "cpue", "log_effort", "geometry")
+sdm_pred_names <- intersect(nb_selected, setdiff(names(coastal_hex), non_pred_cols))
+coastal_hex <- coastal_hex[complete.cases(st_drop_geometry(coastal_hex)[, sdm_pred_names]), ]
+
+# Bring effort in by index match (avoids dplyr .x/.y duplication).
+m_effort <- match(coastal_hex$h3_address, h3_data$h3_address)
+coastal_hex$effort_n <- h3_data$effort_n[m_effort]
+coastal_hex$effort_n[is.na(coastal_hex$effort_n)] <- 0
+
+# One presence per hex: hexes containing at least one Urticina record.
+urticina_hex <- st_join(urticina_sf, h3_data |> select(h3_address), join = st_within)
+presence_hex_ids <- urticina_hex |> filter(!is.na(h3_address)) |> distinct(h3_address) |> pull(h3_address)
+coastal_hex$is_presence <- coastal_hex$h3_address %in% presence_hex_ids
+
+# Effort-weighted background, sampled with replacement from the coastal pool.
+set.seed(42)
+n_bg <- 5000
+bg_idx <- sample.int(nrow(coastal_hex), size = n_bg, replace = TRUE, prob = coastal_hex$effort_n)
+
+# Pre-extracted SWD frames for ENMeval (envs = NULL): lon, lat, then predictors.
+hex_coords <- as.data.frame(st_coordinates(st_centroid(coastal_hex)))
+names(hex_coords) <- c("longitude", "latitude")
+predictor_df <- st_drop_geometry(coastal_hex)[, sdm_pred_names, drop = FALSE]
+presence_idx <- which(coastal_hex$is_presence)
+occs_df <- data.frame(longitude = hex_coords$longitude[presence_idx],
+                      latitude  = hex_coords$latitude[presence_idx],
+                      predictor_df[presence_idx, , drop = FALSE])
+bg_df <- data.frame(longitude = hex_coords$longitude[bg_idx],
+                    latitude  = hex_coords$latitude[bg_idx],
+                    predictor_df[bg_idx, , drop = FALSE])
+```
+
+ENMeval tunes feature classes and regularization by block cross-validation.
+
+```{r}
+#| label: maxent-tune
+#| cache: true
+#| output: false
+tune_results <- ENMevaluate(
+  occs = occs_df, envs = NULL, bg = bg_df,
+  algorithm = "maxnet", partitions = "block",
+  tune.args = list(fc = c("L", "LQ"), rm = c(0.5, 1, 1.5, 2, 3, 5)),
+  doClamp = TRUE
+)
+save_output(tune_results, "05-sdm-eval")
+```
+
+Select by maximum cross-validated AUC (ties broken toward higher regularization), then predict suitability for every coastal hex.
+
+```{r}
+#| label: maxent-predict
+eval_results <- eval.results(tune_results)
+best_idx <- which.max(eval_results$auc.val.avg)
+tied <- which(eval_results$auc.val.avg == eval_results$auc.val.avg[best_idx])
+if (length(tied) > 1) best_idx <- tied[which.max(eval_results$rm[tied])]
+model_names <- names(eval.models(tune_results))
+best_model <- eval.models(tune_results)[[model_names[best_idx]]]
+
+hex_suit <- as.numeric(predict(best_model, predictor_df, type = "cloglog", clamp = TRUE))
+suitability_sf <- coastal_hex |> mutate(suitability = hex_suit) |> select(h3_address, suitability, geometry)
+
+save_output(best_model, "05-maxent-model")
+save_output(suitability_sf, "05-sdm-prediction")
+```
+
+# Distributional synthesis
+
+Spearman concordance between MaxEnt suitability and NB-predicted encounter rate across coastal cells.
+
+```{r}
+#| label: concordance
+h3_data     <- load_output("02-cpue-hex")
+h3_uncorr   <- load_output("03-predictors-uncorr")
+suitability  <- load_output("05-sdm-prediction")
+nb_model     <- load_output("04-nb-model")
+scale_params <- load_output("04-scale-params")
+
+h3_pred <- h3_uncorr |> drop_na()
+suit_vals <- extract_suitability(h3_pred, suitability)
+
+# Re-scale predictors with the saved NB parameters, predict at median effort.
+nb_pred_data <- h3_pred |> st_drop_geometry()
+for (v in scale_params$variable) {
+  sp <- scale_params[scale_params$variable == v, ]
+  if (v %in% names(nb_pred_data)) nb_pred_data[[v]] <- (nb_pred_data[[v]] - sp$center) / sp$scale
+}
+median_log_effort <- median(log(h3_data$effort_n[h3_data$effort_n > 0]))
+nb_pred_data$log_effort <- median_log_effort
+pred_counts <- predict(nb_model, newdata = nb_pred_data, type = "response")
+
+concordance_df <- data.frame(
+  suitability = suit_vals,
+  predicted_cpue = pred_counts / exp(median_log_effort),
+  has_effort = h3_pred$effort_n > 0,
+  has_urticina = h3_pred$urticina_n > 0
+) |> filter(!is.na(suitability))
+
+rho_all <- cor(concordance_df$suitability, concordance_df$predicted_cpue,
+               method = "spearman", use = "complete.obs")
+rho_effort <- cor(concordance_df$suitability[concordance_df$has_effort],
+                  concordance_df$predicted_cpue[concordance_df$has_effort],
+                  method = "spearman", use = "complete.obs")
+```
+
+# Thermal performance
+
+Bayesian nonlinear mixed-effects TPCs (4 shapes x 3 behavioral structures); the shipped fits are loaded and T~opt~, R~max~, CTmax, and the behavioral multiplier derived from them.
+
+```{r}
+#| label: tpc-data
+o2_exp  <- read_xlsx(here::here("data", "clean", "anemone_oxygen.xlsx"), sheet = "experimental_data")
+o2_ctrl <- read_xlsx(here::here("data", "clean", "anemone_oxygen.xlsx"), sheet = "control_data")
+wt_raw  <- read_xlsx(here::here("data", "clean", "anemone_weights.xlsx"), sheet = "data")
+
+# Raw O2 consumption (mg O2 / h), control-corrected per trial.
+o2_exp <- o2_exp |>
+  mutate(duration_h = as.numeric(difftime(end.time, start.time, units = "hours")),
+         delta_o2 = init.o - final.o,
+         o2_rate_raw = (delta_o2 * volume) / duration_h)
+ctrl_rates <- o2_ctrl |>
+  mutate(duration_h = as.numeric(difftime(end.time, start.time, units = "hours")),
+         delta_o2 = init.o - final.o,
+         ctrl_rate = (delta_o2 * volume) / duration_h) |>
+  group_by(trial, set.temp) |>
+  summarise(mean_ctrl_rate = mean(ctrl_rate, na.rm = TRUE), .groups = "drop")
+o2_exp <- o2_exp |>
+  left_join(ctrl_rates, by = c("trial", "set.temp")) |>
+  mutate(o2_rate_corrected = o2_rate_raw - mean_ctrl_rate)
+
+# Mass-specific rate on dry mass (g); centered log dry mass for the SS mass follow-up.
+wt_data <- wt_raw |> mutate(dry_mass_g = (dm_wb_mg - wb_mg) / 1000)
+tpc_data <- o2_exp |>
+  left_join(wt_data |> select(id, dry_mass_g), by = "id") |>
+  mutate(rate_mass_specific = o2_rate_corrected / dry_mass_g,
+         temperature = meas.temp,
+         log_dry_mass = log(dry_mass_g)) |>
+  filter(!is.na(rate_mass_specific), !is.na(temperature)) |>
+  mutate(log_dry_mass_c = log_dry_mass - mean(log_dry_mass, na.rm = TRUE))
+
+# Treatment-averaged means (plotting reference); factor id and inverse temp for brms.
+tpc_means <- tpc_data |>
+  group_by(set.temp) |>
+  summarise(temperature = mean(temperature, na.rm = TRUE),
+            rate = mean(rate_mass_specific, na.rm = TRUE), .groups = "drop")
+tpc_data <- tpc_data |> mutate(id = factor(id), invtempK = 1.0 / (temperature + 273.15))
+```
+
+## Model specification
+
+Weakly informative priors and 4 shapes x 3 behavioral structures, plus mass-adjusted Sharpe-Schoolfield variants.
+
+```{r}
+#| label: tpc-priors
+# Location-scale params are dimensionless; amplitude params rescaled for dry-mass rates.
+gauss_priors <- c(
+  prior(normal(325, 130), nlpar = "rmax", lb = 0),
+  prior(normal(20, 10), nlpar = "topt"),
+  prior(normal(15, 10), nlpar = "a", lb = 1)
+)
+
+quad_priors <- c(
+  prior(normal(0, 200), nlpar = "qa"),
+  prior(normal(20, 20), nlpar = "qb"),
+  prior(normal(-0.3, 0.6), nlpar = "qc", ub = 0)
+)
+
+briere_priors <- c(
+  prior(normal(0.007, 0.03), nlpar = "ba", lb = 0),
+  prior(normal(-2, 5), nlpar = "tmin", ub = 5),
+  prior(normal(32, 3), nlpar = "tmax", lb = 25, ub = 40),
+  prior(normal(2, 1), nlpar = "bb", lb = 0.5, ub = 5)
+)
+
+sharpe_priors <- c(
+  prior(normal(260, 130), nlpar = "rref", lb = 0),
+  prior(normal(0.5, 0.3), nlpar = "ea", lb = 0),
+  prior(normal(3, 2), nlpar = "eah", lb = 0),
+  prior(normal(0.0033, 0.0002), nlpar = "invth"),
+  prior(normal(0.00345, 0.0005), nlpar = "invtref")
+)
+
+bopen_prior <- prior(normal(130, 100), nlpar = "bopen")
+sone_prior <- prior(normal(1, 1), nlpar = "sone", lb = 0)
+
+# Allometric coefficient prior on rref: centered on 0, broad enough for Kleiber slopes.
+mass_prior <- prior(normal(0, 100), nlpar = "rref", coef = "log_dry_mass_c")
+
+model_specs <- list(
+
+  # === Gaussian (1987) ===
+  gaussian_naive = list(
+    shape = "Gaussian", structure = "Naive",
+    formula = bf(
+      rate_mass_specific ~ rmax * exp(-(temperature - topt)^2 / (2 * a^2)),
+      rmax ~ 1 + (1 | id), topt ~ 1, a ~ 1, nl = TRUE),
+    priors = gauss_priors
+  ),
+  gaussian_additive = list(
+    shape = "Gaussian", structure = "Additive",
+    formula = bf(
+      rate_mass_specific ~ rmax * exp(-(temperature - topt)^2 / (2 * a^2)) +
+        bopen * avg.openness,
+      rmax ~ 1 + (1 | id), topt ~ 1, a ~ 1, bopen ~ 1, nl = TRUE),
+    priors = c(gauss_priors, bopen_prior)
+  ),
+  gaussian_multiplicative = list(
+    shape = "Gaussian", structure = "Multiplicative",
+    formula = bf(
+      rate_mass_specific ~ rmax * exp(-(temperature - topt)^2 / (2 * a^2)) *
+        (1 + sone * avg.openness),
+      rmax ~ 1 + (1 | id), topt ~ 1, a ~ 1, sone ~ 1, nl = TRUE),
+    priors = c(gauss_priors, sone_prior)
+  ),
+
+  # === Quadratic (2008) ===
+  quadratic_naive = list(
+    shape = "Quadratic", structure = "Naive",
+    formula = bf(
+      rate_mass_specific ~ qa + qb * temperature + qc * temperature^2,
+      qa ~ 1 + (1 | id), qb ~ 1, qc ~ 1, nl = TRUE),
+    priors = quad_priors
+  ),
+  quadratic_additive = list(
+    shape = "Quadratic", structure = "Additive",
+    formula = bf(
+      rate_mass_specific ~ qa + qb * temperature + qc * temperature^2 +
+        bopen * avg.openness,
+      qa ~ 1 + (1 | id), qb ~ 1, qc ~ 1, bopen ~ 1, nl = TRUE),
+    priors = c(quad_priors, bopen_prior)
+  ),
+  quadratic_multiplicative = list(
+    shape = "Quadratic", structure = "Multiplicative",
+    formula = bf(
+      rate_mass_specific ~ (qa + qb * temperature + qc * temperature^2) *
+        (1 + sone * avg.openness),
+      qa ~ 1 + (1 | id), qb ~ 1, qc ~ 1, sone ~ 1, nl = TRUE),
+    priors = c(quad_priors, sone_prior)
+  ),
+
+  # === Briere2 (1999) ===
+  briere2_naive = list(
+    shape = "Briere2", structure = "Naive",
+    formula = bf(
+      rate_mass_specific ~ ba * temperature * (temperature - tmin) *
+        (tmax - temperature)^(1 / bb),
+      ba ~ 1 + (1 | id), tmin ~ 1, tmax ~ 1, bb ~ 1, nl = TRUE),
+    priors = briere_priors
+  ),
+  briere2_additive = list(
+    shape = "Briere2", structure = "Additive",
+    formula = bf(
+      rate_mass_specific ~ ba * temperature * (temperature - tmin) *
+        (tmax - temperature)^(1 / bb) + bopen * avg.openness,
+      ba ~ 1 + (1 | id), tmin ~ 1, tmax ~ 1, bb ~ 1, bopen ~ 1, nl = TRUE),
+    priors = c(briere_priors, bopen_prior)
+  ),
+  briere2_multiplicative = list(
+    shape = "Briere2", structure = "Multiplicative",
+    formula = bf(
+      rate_mass_specific ~ ba * temperature * (temperature - tmin) *
+        (tmax - temperature)^(1 / bb) * (1 + sone * avg.openness),
+      ba ~ 1 + (1 | id), tmin ~ 1, tmax ~ 1, bb ~ 1, sone ~ 1, nl = TRUE),
+    priors = c(briere_priors, sone_prior)
+  ),
+
+  # === Sharpe-Schoolfield (1981, high-temperature inactivation; inverse-temp param) ===
+  sharpe_naive = list(
+    shape = "Sharpe-Schoolfield", structure = "Naive",
+    formula = bf(
+      rate_mass_specific ~ rref * exp(ea * 11604.5 * (invtref - invtempK)) /
+        (1 + exp(eah * 11604.5 * (invth - invtempK))),
+      rref ~ 1 + (1 | id), ea ~ 1, eah ~ 1, invth ~ 1, invtref ~ 1,
+      nl = TRUE),
+    priors = sharpe_priors
+  ),
+  sharpe_additive = list(
+    shape = "Sharpe-Schoolfield", structure = "Additive",
+    formula = bf(
+      rate_mass_specific ~ rref * exp(ea * 11604.5 * (invtref - invtempK)) /
+        (1 + exp(eah * 11604.5 * (invth - invtempK))) +
+        bopen * avg.openness,
+      rref ~ 1 + (1 | id), ea ~ 1, eah ~ 1, invth ~ 1, invtref ~ 1,
+      bopen ~ 1, nl = TRUE),
+    priors = c(sharpe_priors, bopen_prior)
+  ),
+  sharpe_multiplicative = list(
+    shape = "Sharpe-Schoolfield", structure = "Multiplicative",
+    formula = bf(
+      rate_mass_specific ~ rref * exp(ea * 11604.5 * (invtref - invtempK)) /
+        (1 + exp(eah * 11604.5 * (invth - invtempK))) *
+        (1 + sone * avg.openness),
+      rref ~ 1 + (1 | id), ea ~ 1, eah ~ 1, invth ~ 1, invtref ~ 1,
+      sone ~ 1, nl = TRUE),
+    priors = c(sharpe_priors, sone_prior)
+  ),
+
+  # === Mass-adjusted Sharpe-Schoolfield: centered log dry mass on rref ===
+  sharpe_naive_mass = list(
+    shape = "Sharpe-Schoolfield + mass", structure = "Naive",
+    formula = bf(
+      rate_mass_specific ~ rref * exp(ea * 11604.5 * (invtref - invtempK)) /
+        (1 + exp(eah * 11604.5 * (invth - invtempK))),
+      rref ~ 1 + log_dry_mass_c + (1 | id),
+      ea ~ 1, eah ~ 1, invth ~ 1, invtref ~ 1, nl = TRUE),
+    priors = c(sharpe_priors, mass_prior)
+  ),
+  sharpe_additive_mass = list(
+    shape = "Sharpe-Schoolfield + mass", structure = "Additive",
+    formula = bf(
+      rate_mass_specific ~ rref * exp(ea * 11604.5 * (invtref - invtempK)) /
+        (1 + exp(eah * 11604.5 * (invth - invtempK))) +
+        bopen * avg.openness,
+      rref ~ 1 + log_dry_mass_c + (1 | id),
+      ea ~ 1, eah ~ 1, invth ~ 1, invtref ~ 1,
+      bopen ~ 1, nl = TRUE),
+    priors = c(sharpe_priors, bopen_prior, mass_prior)
+  ),
+  sharpe_multiplicative_mass = list(
+    shape = "Sharpe-Schoolfield + mass", structure = "Multiplicative",
+    formula = bf(
+      rate_mass_specific ~ rref * exp(ea * 11604.5 * (invtref - invtempK)) /
+        (1 + exp(eah * 11604.5 * (invth - invtempK))) *
+        (1 + sone * avg.openness),
+      rref ~ 1 + log_dry_mass_c + (1 | id),
+      ea ~ 1, eah ~ 1, invth ~ 1, invtref ~ 1,
+      sone ~ 1, nl = TRUE),
+    priors = c(sharpe_priors, sone_prior, mass_prior)
+  )
+)
+```
+
+## Model fitting
+
+Documents how the shipped fits were produced; not run on render (`eval: false`), so the section reads the cached fits rather than re-sampling.
+
+```{r}
+#| label: brms-fit
+#| eval: false
+
+cache_dir <- here::here("data", "clean", "06-brms-cache")
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+brm_ctrl <- list(adapt_delta = 0.95, max_treedepth = 12)
+# Mass-adjusted SS variants need stricter HMC (adapt_delta = 0.99, max_treedepth = 13).
+brm_ctrl_mass <- list(adapt_delta = 0.99, max_treedepth = 13)
+brm_args <- list(chains = 4, iter = 4000, warmup = 2000, cores = 4,
+                  backend = "cmdstanr", silent = 2, seed = 20260420)
+
+# SS multiplicative is edge-of-identifiable; retry alternative seeds on failure.
+fit_or_load <- function(label, formula, priors, data, cache_dir,
+                         retry_seeds = c(20260420, 42, 7, 2025)) {
+  cache_file <- file.path(cache_dir, paste0(label, ".rds"))
+  if (file.exists(cache_file)) {
+    return(readRDS(cache_file))
+  }
+
+  ctrl <- if (endsWith(label, "_mass")) brm_ctrl_mass else brm_ctrl
+
+  for (s_idx in seq_along(retry_seeds)) {
+    seed_i <- retry_seeds[s_idx]
+    args_i <- brm_args
+    args_i$seed <- seed_i
+    fit <- tryCatch(
+      do.call(brm, c(list(formula = formula, data = data, prior = priors,
+                           control = ctrl), args_i)),
+      error = function(e) {
+        NULL
+      }
+    )
+    if (!is.null(fit)) {
+      s <- summary(fit)
+      max_rhat <- max(s$fixed$Rhat, na.rm = TRUE)
+      n_div <- sum(nuts_params(fit)$Value[nuts_params(fit)$Parameter == "divergent__"])
+      if (max_rhat > 1.05 || n_div > 20) {
+        cat(sprintf("CONVERGENCE FAILURE (Rhat=%.2f, %d divergent); retrying with new seed\n",
+                    max_rhat, n_div))
+        next
+      }
+      lo <- loo(fit)
+      looic <- lo$estimates["looic", "Estimate"]
+      saveRDS(fit, cache_file)
+      return(fit)
+    }
+  }
+  return(NULL)
+}
+
+results <- list()
+failed <- list()
+
+for (label in names(model_specs)) {
+  spec <- model_specs[[label]]
+  fit <- fit_or_load(label, spec$formula, spec$priors, tpc_data, cache_dir)
+  if (!is.null(fit)) {
+    lo <- loo(fit)
+    results[[label]] <- list(
+      model = fit,
+      loo = lo,
+      looic = lo$estimates["looic", "Estimate"],
+      shape = spec$shape,
+      structure = spec$structure
+    )
+  } else {
+    failure_reason <- if (spec$structure == "Additive") {
+      "Convergence failure: additive offset non-identifiable"
+    } else if (spec$structure == "Multiplicative") {
+      "Convergence failure: multiplicative curvature unconstrained"
+    } else {
+      "Convergence failure: naive fit"
+    }
+    failed[[label]] <- list(
+      shape = spec$shape,
+      structure = spec$structure,
+      reason = failure_reason
+    )
+  }
+}
+
+cat(sprintf("\n%d models converged, %d failed\n",
+            length(results), length(failed)))
+```
+
+## Load fitted models
+
+Load the shipped fits and the derived model-comparison table; define the CTmax grids and extractor reused below.
+
+```{r}
+#| label: tpc-load
+tpc_fits <- load_output("06-tpc-fits")
+
+best_fit         <- tpc_fits$best_model
+best_label       <- tpc_fits$best_label
+best_shape       <- tpc_fits$best_shape
+best_structure   <- tpc_fits$best_structure
+best_naive_fit   <- tpc_fits$naive_model
+best_naive_label <- tpc_fits$naive_label
+all_failures     <- tpc_fits$failed_models
+comp_df          <- tpc_fits$loo_comparison
+
+# Wide grid (0-150 C) so CTmax reflects each model's true peak, not the range edge.
+topt_ctmax_temps <- seq(0, 150, by = 0.1)
+ctmax_grid_open <- data.frame(temperature = topt_ctmax_temps, avg.openness = 1,
+  invtempK = 1 / (topt_ctmax_temps + 273.15), log_dry_mass_c = 0, id = NA)
+ctmax_grid_closed <- data.frame(temperature = topt_ctmax_temps, avg.openness = 0,
+  invtempK = 1 / (topt_ctmax_temps + 273.15), log_dry_mass_c = 0, id = NA)
+
+find_ctmax_from_pred <- function(pred, temps) {
+  pred <- pmax(pred, 0)
+  peak_idx <- which.max(pred)
+  rmax_val <- pred[peak_idx]
+  if (rmax_val <= 0) return(NA_real_)
+  threshold <- 0.05 * rmax_val
+  above_topt <- which(temps > temps[peak_idx])
+  below_thresh <- above_topt[pred[above_topt] < threshold]
+  if (length(below_thresh) > 0) return(round(temps[below_thresh[1]], 1))
+  zero_idx <- above_topt[pred[above_topt] < 1e-6]
+  if (length(zero_idx) > 0) return(round(temps[zero_idx[1]], 1))
+  NA_real_
+}
+
+get_ctmax <- function(label, fit, shape) {
+  # Gaussian closed form: topt + a * sqrt(-2 * log(0.05)).
+  if (shape == "Gaussian") {
+    draws <- tryCatch(as_draws_df(fit), error = function(e) NULL)
+    if (!is.null(draws) &&
+        all(c("b_topt_Intercept", "b_a_Intercept") %in% colnames(draws))) {
+      ctmax_draws <- draws$b_topt_Intercept +
+        draws$b_a_Intercept * sqrt(-2 * log(0.05))
+      return(round(median(ctmax_draws), 1))
+    }
+  }
+  # Otherwise numerical threshold; try fully expanded, fall back to closed.
+  pred <- tryCatch(
+    fitted(fit, newdata = ctmax_grid_open, re_formula = NA, summary = TRUE)[, "Estimate"],
+    error = function(e) rep(NA, nrow(ctmax_grid_open))
+  )
+  if (all(is.na(pred))) return(NA_real_)
+  result <- find_ctmax_from_pred(pred, ctmax_grid_open$temperature)
+  if (!is.na(result)) return(result)
+  pred0 <- tryCatch(
+    fitted(fit, newdata = ctmax_grid_closed, re_formula = NA, summary = TRUE)[, "Estimate"],
+    error = function(e) rep(NA, nrow(ctmax_grid_closed))
+  )
+  find_ctmax_from_pred(pred0, ctmax_grid_closed$temperature)
+}
+```
+
+## Parameter derivation
+
+T~opt~/R~max~ from per-draw argmax, plus CTmax and the behavioral multiplier for the best model.
+
+```{r}
+#| label: tpc-params
+draws <- as_draws_df(best_fit)
+
+# Numerical Topt/Rmax: population predictions across the observed range, argmax.
+temp_grid <- data.frame(
+  temperature = seq(min(tpc_data$temperature), max(tpc_data$temperature), by = 0.1),
+  avg.openness = mean(tpc_data$avg.openness),
+  invtempK = 1 / (seq(min(tpc_data$temperature), max(tpc_data$temperature), by = 0.1) + 273.15),
+  log_dry_mass_c = 0,
+  id = NA
+)
+pred_grid <- fitted(best_fit, newdata = temp_grid, re_formula = NA, summary = TRUE)
+peak_idx <- which.max(pred_grid[, "Estimate"])
+topt_est <- temp_grid$temperature[peak_idx]
+rmax_est <- pred_grid[peak_idx, "Estimate"]
+
+if (best_shape == "Gaussian") {
+  topt_draws <- draws$b_topt_Intercept
+  rmax_draws <- draws$b_rmax_Intercept
+  a_draws <- draws$b_a_Intercept
+  topt_est <- median(topt_draws)
+  topt_ci <- as.numeric(quantile(topt_draws, c(0.025, 0.975)))
+  rmax_est <- median(rmax_draws)
+  rmax_ci <- as.numeric(quantile(rmax_draws, c(0.025, 0.975)))
+  a_est <- median(a_draws)
+  # Gaussian CTmax / thermal breadth at 5% of Rmax.
+  ctmax_gauss_draws <- topt_draws + a_draws * sqrt(-2 * log(0.05))
+  ctmax_gauss_est <- median(ctmax_gauss_draws)
+  ctmax_gauss_ci <- as.numeric(quantile(ctmax_gauss_draws, c(0.025, 0.975)))
+  ctmin_gauss_draws <- topt_draws - a_draws * sqrt(-2 * log(0.05))
+  ctmin_gauss_est <- median(ctmin_gauss_draws)
+  breadth_draws <- ctmax_gauss_draws - ctmin_gauss_draws
+  breadth_est <- median(breadth_draws)
+  breadth_ci <- as.numeric(quantile(breadth_draws, c(0.025, 0.975)))
+} else if (best_shape == "Quadratic") {
+  qa_draws <- draws$b_qa_Intercept
+  qb_draws <- draws$b_qb_Intercept
+  qc_draws <- draws$b_qc_Intercept
+  topt_draws <- -qb_draws / (2 * qc_draws)
+  rmax_draws <- qa_draws - qb_draws^2 / (4 * qc_draws)
+  topt_est <- median(topt_draws)
+  topt_ci <- as.numeric(quantile(topt_draws, c(0.025, 0.975)))
+  rmax_est <- median(rmax_draws)
+  rmax_ci <- as.numeric(quantile(rmax_draws, c(0.025, 0.975)))
+} else {
+  # Briere2 / Sharpe-Schoolfield: per-draw argmax gives genuine Topt/Rmax CIs.
+  pred_all <- fitted(best_fit, newdata = temp_grid, re_formula = NA, summary = FALSE)
+  peak_idx_per_draw <- apply(pred_all, 1, which.max)
+  topt_draws <- temp_grid$temperature[peak_idx_per_draw]
+  rmax_draws <- apply(pred_all, 1, max)
+  topt_est <- median(topt_draws)
+  topt_ci <- as.numeric(quantile(topt_draws, c(0.025, 0.975)))
+  rmax_est <- median(rmax_draws)
+  rmax_ci <- as.numeric(quantile(rmax_draws, c(0.025, 0.975)))
+}
+
+# Non-Gaussian best model: read symmetric-model CTmax/breadth from the shipped fits.
+if (!exists("ctmax_gauss_est")) {
+  ctmax_gauss_est <- tpc_fits$params$ctmax_gaussian
+  ctmax_gauss_ci  <- as.numeric(tpc_fits$params$ctmax_gaussian_ci)
+  breadth_est     <- tpc_fits$params$breadth
+  breadth_ci      <- as.numeric(tpc_fits$params$breadth_ci)
+}
+
+# Behavioral multiplier (multiplicative) or additive offset.
+if (best_structure == "Multiplicative") {
+  sone_draws <- draws$b_sone_Intercept
+  sone_est <- median(sone_draws)
+  sone_ci <- as.numeric(quantile(sone_draws, c(0.025, 0.975)))
+  expansion_multiplier <- 1 + sone_est
+  pct_behavioral <- sone_est / (1 + sone_est) * 100
+} else if (best_structure == "Additive") {
+  bopen_draws <- draws$b_bopen_Intercept
+  bopen_est <- median(bopen_draws)
+  bopen_ci <- as.numeric(quantile(bopen_draws, c(0.025, 0.975)))
+}
+
+ctmax_empirical <- 28  # midpoint of 25-30 C bracket
+
+# Numerical CTmax from best model (5% of Rmax); CI from posterior draws.
+ctmax_best <- get_ctmax(best_label, best_fit, best_shape)
+if (best_shape == "Gaussian" && exists("ctmax_gauss_est")) {
+  ctmax_best    <- round(ctmax_gauss_est, 1)
+  ctmax_best_ci <- round(ctmax_gauss_ci, 1)
+} else {
+  draws_sub <- as_draws_df(best_fit)
+  n_draws_ctmax <- min(500, nrow(draws_sub))
+  set.seed(42)
+  draw_idx <- sample(nrow(draws_sub), n_draws_ctmax)
+  pred_full <- fitted(best_fit, newdata = ctmax_grid_open, re_formula = NA, summary = FALSE)
+  ctmax_draws <- sapply(draw_idx, function(d) {
+    tryCatch({
+      pred_d <- pmax(pred_full[d, ], 0)
+      peak   <- which.max(pred_d)
+      threshold <- 0.05 * pred_d[peak]
+      above <- which(ctmax_grid_open$temperature > ctmax_grid_open$temperature[peak])
+      below <- above[pred_d[above] < threshold]
+      if (length(below) > 0) ctmax_grid_open$temperature[below[1]] else NA_real_
+    }, error = function(e) NA_real_)
+  })
+  ctmax_best_ci <- round(quantile(ctmax_draws, c(0.025, 0.975), na.rm = TRUE), 1)
+}
+ctmax_briere2 <- tpc_fits$params$ctmax_briere2
+```
+
+## Behavioral decomposition
+
+Best-model predictions at mean, fully expanded, and fully closed states, with the naive-model curve for comparison.
+
+```{r}
+#| label: tpc-behavioral
+temp_seq <- seq(min(tpc_data$temperature) - 1, max(tpc_data$temperature) + 1, length.out = 200)
+
+if (best_structure %in% c("Multiplicative", "Additive")) {
+  newdata_naive <- data.frame(temperature = temp_seq, avg.openness = mean(tpc_data$avg.openness),
+    invtempK = 1 / (temp_seq + 273.15), log_dry_mass_c = 0, id = NA)
+  newdata_expanded <- data.frame(temperature = temp_seq, avg.openness = 1,
+    invtempK = 1 / (temp_seq + 273.15), log_dry_mass_c = 0, id = NA)
+  newdata_closed <- data.frame(temperature = temp_seq, avg.openness = 0,
+    invtempK = 1 / (temp_seq + 273.15), log_dry_mass_c = 0, id = NA)
+  pred_mean <- fitted(best_fit, newdata = newdata_naive, re_formula = NA, summary = TRUE)[, "Estimate"]
+  pred_expanded <- fitted(best_fit, newdata = newdata_expanded, re_formula = NA, summary = TRUE)[, "Estimate"]
+  pred_closed <- fitted(best_fit, newdata = newdata_closed, re_formula = NA, summary = TRUE)[, "Estimate"]
+} else {
+  newdata_naive <- data.frame(temperature = temp_seq,
+    invtempK = 1 / (temp_seq + 273.15), log_dry_mass_c = 0, id = NA)
+  pred_mean <- fitted(best_fit, newdata = newdata_naive, re_formula = NA, summary = TRUE)[, "Estimate"]
+  pred_expanded <- pred_mean
+  pred_closed <- pred_mean
+}
+
+# Naive-model curve for comparison.
+newdata_naive_model <- data.frame(temperature = temp_seq,
+  invtempK = 1 / (temp_seq + 273.15), log_dry_mass_c = 0, id = NA)
+pred_naive <- fitted(best_naive_fit, newdata = newdata_naive_model, re_formula = NA, summary = TRUE)[, "Estimate"]
+tpc_pred <- data.frame(temperature = temp_seq, rate = pred_naive)
+```
+
+## Save outputs
+
+```{r}
+#| label: tpc-save
+output_list <- list(
+  # Data
+  tpc_data = tpc_data,
+  tpc_means = tpc_means,
+
+  # Best model info
+  best_model = best_fit,
+  best_label = best_label,
+  best_shape = best_shape,
+  best_structure = best_structure,
+
+  # Predictions for plotting
+  tpc_pred = tpc_pred,
+  tpc_pred_expanded = data.frame(temperature = temp_seq, rate = pred_expanded),
+  tpc_pred_closed = data.frame(temperature = temp_seq, rate = pred_closed),
+
+  # Parameters (posterior summaries)
+  params = list(
+    topt = topt_est,
+    topt_ci = as.numeric(topt_ci),
+    rmax = rmax_est,
+    rmax_ci = as.numeric(rmax_ci),
+    breadth = if (exists("breadth_est")) breadth_est else NA,
+    breadth_ci = if (exists("breadth_ci")) as.numeric(breadth_ci) else c(NA, NA),
+    ctmax_gaussian = if (exists("ctmax_gauss_est")) ctmax_gauss_est else NA,
+    ctmax_gaussian_ci = if (exists("ctmax_gauss_ci")) as.numeric(ctmax_gauss_ci) else c(NA, NA),
+    ctmax_best = if (exists("ctmax_best")) ctmax_best else NA,
+    ctmax_best_ci = if (exists("ctmax_best_ci")) ctmax_best_ci else c(NA, NA),
+    ctmax_briere2 = ctmax_briere2,
+    ctmax_empirical = ctmax_empirical
+  ),
+
+  # Behavioral decomposition
+  behavioral = list(
+    structure = best_structure,
+    sone = if (exists("sone_est")) sone_est else NA,
+    sone_ci = if (exists("sone_ci")) as.numeric(sone_ci) else c(NA, NA),
+    bopen = if (exists("bopen_est")) bopen_est else NA,
+    expansion_multiplier = if (exists("expansion_multiplier")) expansion_multiplier else NA,
+    pct_behavioral = if (exists("pct_behavioral")) pct_behavioral else NA
+  ),
+
+  # Model comparison
+  loo_comparison = comp_df,
+  failed_models = all_failures,
+
+  # Naive model for comparison
+  naive_model = best_naive_fit,
+  naive_label = best_naive_label,
+
+  # Round-4 mass-adjustment follow-up (Comment 13)
+  mass_followup = if (exists("mass_followup")) mass_followup else NULL,
+  mass_followup_dlooic = if (exists("ss_dlooic")) ss_dlooic else NULL,
+  ss_multiplicative_mass_fit = tpc_fits$ss_multiplicative_mass_fit
+)
+
+save_output(output_list, "06-tpc-fits")
+```

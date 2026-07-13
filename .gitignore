@@ -1,0 +1,18 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Quarto
+/.quarto/
+_freeze/
+*_files/
+*.html
+
+# Generated figures
+figures/*
+!figures/fig1-organism-inset.png
+# Caches
+*_cache/
+data/clean/06-brms-cache/
